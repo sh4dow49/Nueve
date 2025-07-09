@@ -1,9 +1,10 @@
 const express = require('express');
-const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const { body, validationResult } = require('express-validator');
 const db = require('../config/database');
 const { authenticateToken } = require('../middleware/auth');
+const { phoneValidation, otpValidation, nameValidation, handleValidationErrors } = require('../utils/validation');
+const { sendSuccess, sendError, sendValidationError } = require('../utils/response');
+const logger = require('../utils/logger');
 
 const router = express.Router();
 
@@ -12,24 +13,19 @@ const generateOTP = () => {
   return Math.floor(100000 + Math.random() * 900000).toString();
 };
 
-// Send OTP (in real app, integrate with SMS service)
+// Send OTP (integrate with SMS service in production)
 const sendOTP = async (phone, otp) => {
   // In production, integrate with SMS service like Twilio, AWS SNS, etc.
-  console.log(`OTP for ${phone}: ${otp}`);
-  // For demo purposes, we'll just log it
+  logger.info(`OTP for ${phone}: ${otp}`);
   return true;
 };
 
 // Send OTP to phone
 router.post('/send-otp', [
-  body('phone').isMobilePhone('en-IN').withMessage('Invalid phone number')
+  phoneValidation,
+  handleValidationErrors
 ], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
     const { phone } = req.body;
     const otp = generateOTP();
     const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
@@ -46,32 +42,30 @@ router.post('/send-otp', [
       [phone, otp, expiresAt]
     );
 
-    // Send OTP (implement SMS service here)
+    // Send OTP
     await sendOTP(phone, otp);
 
-    res.json({ 
+    logger.info(`OTP sent to ${phone}`);
+    
+    sendSuccess(res, {
       message: 'OTP sent successfully',
       // In production, don't send OTP in response
       otp: process.env.NODE_ENV === 'development' ? otp : undefined
     });
 
   } catch (error) {
-    console.error('Send OTP error:', error);
-    res.status(500).json({ error: 'Failed to send OTP' });
+    logger.error('Send OTP error:', error);
+    sendError(res, 'Failed to send OTP');
   }
 });
 
 // Verify OTP and login/register
 router.post('/verify-otp', [
-  body('phone').isMobilePhone('en-IN').withMessage('Invalid phone number'),
-  body('otp').isLength({ min: 6, max: 6 }).withMessage('OTP must be 6 digits')
+  phoneValidation,
+  otpValidation,
+  handleValidationErrors
 ], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
     const { phone, otp } = req.body;
 
     // Verify OTP
@@ -81,7 +75,7 @@ router.post('/verify-otp', [
     );
 
     if (otpRows.length === 0) {
-      return res.status(400).json({ error: 'Invalid or expired OTP' });
+      return sendError(res, 'Invalid or expired OTP', 400);
     }
 
     // Mark OTP as used
@@ -113,6 +107,7 @@ router.post('/verify-otp', [
       
       user = newUser[0];
       isNewUser = true;
+      logger.info(`New user created: ${phone}`);
     } else {
       // Update existing user as verified
       await db.execute(
@@ -120,6 +115,7 @@ router.post('/verify-otp', [
         [phone]
       );
       user = users[0];
+      logger.info(`User logged in: ${phone}`);
     }
 
     // Generate JWT token
@@ -129,8 +125,7 @@ router.post('/verify-otp', [
       { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
     );
 
-    res.json({
-      message: 'OTP verified successfully',
+    sendSuccess(res, {
       token,
       user: {
         id: user.id,
@@ -141,32 +136,29 @@ router.post('/verify-otp', [
         isVerified: user.is_verified
       },
       isNewUser
-    });
+    }, 'OTP verified successfully');
 
   } catch (error) {
-    console.error('Verify OTP error:', error);
-    res.status(500).json({ error: 'Failed to verify OTP' });
+    logger.error('Verify OTP error:', error);
+    sendError(res, 'Failed to verify OTP');
   }
 });
 
 // Complete user profile
-router.post('/complete-profile', authenticateToken, [
-  body('name').trim().isLength({ min: 2, max: 100 }).withMessage('Name must be 2-100 characters'),
+router.post('/complete-profile', [
+  authenticateToken,
+  nameValidation,
   body('birthDate').isISO8601().withMessage('Invalid birth date'),
-  body('gender').isIn(['male', 'female', 'other']).withMessage('Invalid gender')
+  body('gender').isIn(['male', 'female', 'other']).withMessage('Invalid gender'),
+  handleValidationErrors
 ], async (req, res) => {
   try {
-    const errors = validationResult(req);
-    if (!errors.isEmpty()) {
-      return res.status(400).json({ errors: errors.array() });
-    }
-
     const { name, birthDate, gender } = req.body;
     const userId = req.user.id;
 
     // Update user profile
     await db.execute(
-      'UPDATE users SET name = ?, birth_date = ?, gender = ? WHERE id = ?',
+      'UPDATE users SET name = ?, birth_date = ?, gender = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
       [name, birthDate, gender, userId]
     );
 
@@ -176,8 +168,9 @@ router.post('/complete-profile', authenticateToken, [
       [userId]
     );
 
-    res.json({
-      message: 'Profile completed successfully',
+    logger.info(`Profile completed for user: ${userId}`);
+
+    sendSuccess(res, {
       user: {
         id: users[0].id,
         phone: users[0].phone,
@@ -186,11 +179,11 @@ router.post('/complete-profile', authenticateToken, [
         gender: users[0].gender,
         isVerified: users[0].is_verified
       }
-    });
+    }, 'Profile completed successfully');
 
   } catch (error) {
-    console.error('Complete profile error:', error);
-    res.status(500).json({ error: 'Failed to complete profile' });
+    logger.error('Complete profile error:', error);
+    sendError(res, 'Failed to complete profile');
   }
 });
 
@@ -203,10 +196,10 @@ router.get('/me', authenticateToken, async (req, res) => {
     );
 
     if (users.length === 0) {
-      return res.status(404).json({ error: 'User not found' });
+      return sendNotFound(res, 'User not found');
     }
 
-    res.json({
+    sendSuccess(res, {
       user: {
         id: users[0].id,
         phone: users[0].phone,
@@ -219,8 +212,8 @@ router.get('/me', authenticateToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('Get user error:', error);
-    res.status(500).json({ error: 'Failed to get user data' });
+    logger.error('Get user error:', error);
+    sendError(res, 'Failed to get user data');
   }
 });
 
